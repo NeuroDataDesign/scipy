@@ -32,6 +32,7 @@ from collections.abc import Iterable
 import warnings
 import numpy
 import operator
+from numpy.core.multiarray import normalize_axis_index
 from . import _ni_support
 from . import _nd_image
 from . import _ni_docstrings
@@ -43,7 +44,7 @@ __all__ = ['correlate1d', 'convolve1d', 'gaussian_filter1d', 'gaussian_filter',
            'uniform_filter1d', 'uniform_filter', 'minimum_filter1d',
            'maximum_filter1d', 'minimum_filter', 'maximum_filter',
            'rank_filter', 'median_filter', 'percentile_filter',
-           'generic_filter1d', 'generic_filter']
+           'generic_filter1d', 'generic_filter', 'gabor_filter']
 
 
 def _invalid_origin(origin, lenw):
@@ -84,7 +85,7 @@ def correlate1d(input, weights, axis=-1, output=None, mode="reflect",
         raise RuntimeError('no filter weights given')
     if not weights.flags.contiguous:
         weights = weights.copy()
-    axis = _ni_support._check_axis(axis, input.ndim)
+    axis = normalize_axis_index(axis, input.ndim)
     if _invalid_origin(origin, len(weights)):
         raise ValueError('Invalid origin; origin must satisfy '
                          '-(len(weights) // 2) <= origin <= '
@@ -303,6 +304,140 @@ def gaussian_filter(input, sigma, order=0, output=None,
 
 
 @_ni_docstrings.docfiller
+def gabor_filter(input, sigma, phi, frequency, offset=0.0, output=None,
+                 mode="reflect", cval=0.0, truncate=3.0):
+    """Multidimensional Gabor filter. A gabor filter
+    is an elementwise product between a Gaussian
+    and a complex exponential.
+
+    Parameters
+    ----------
+    %(input)s
+    sigma : scalar or sequence of scalars
+        Standard deviation for Gaussian kernel. The standard
+        deviations of the Gaussian filter are given for each axis as a
+        sequence, or as a single number, in which case it is equal for
+        all axes.
+    phi : scalar or sequence of scalars
+        Angles specifying orientation of the periodic complex
+        exponential. If the input is n-dimensional, then phi
+        is a sequence of length n-1. Convention follows
+        https://en.wikipedia.org/wiki/N-sphere#Spherical_coordinates.
+    frequency : scalar
+        Frequency of the complex exponential. Units are revolutions/voxels.
+    offset : scalar
+        Phase shift of the complex exponential. Units are radians.
+    output : array or dtype, optional
+        The array in which to place the output, or the dtype of the
+        returned array. By default an array of the same dtype as input
+        will be created. Only the real component will be saved
+        if output is an array.
+    %(mode)s
+    %(cval)s
+    truncate : float
+        Truncate the filter at this many standard deviations.
+        Default is 3.0.
+
+    Returns
+    -------
+    real, imaginary : arrays
+        Returns real and imaginary responses, arrays of same
+        shape as `input`.
+
+    Notes
+    -----
+    The multidimensional filter is implemented by creating
+    a gabor filter array, then using the convolve method.
+    Also, sigma specifies the standard deviations of the
+    Gaussian along the coordinate axes, and the Gaussian
+    is not rotated. This is unlike
+    skimage.filters.gabor, whose Gaussian is
+    rotated with the complex exponential.
+    The reasoning behind this design choice is that
+    sigma can be more easily designed to deal with
+    anisotropic voxels.
+
+    Examples
+    --------
+    >>> from scipy.ndimage import gabor_filter
+    >>> a = np.arange(50, step=2).reshape((5,5))
+    >>> a
+    array([[ 0,  2,  4,  6,  8],
+           [10, 12, 14, 16, 18],
+           [20, 22, 24, 26, 28],
+           [30, 32, 34, 36, 38],
+           [40, 42, 44, 46, 48]])
+    >>> gabor_filter(a, sigma=1, phi=[0.0], frequency=0.1)
+    (array([[ 3,  5,  6,  8,  9],
+            [ 9, 10, 12, 13, 14],
+            [16, 18, 19, 21, 22],
+            [24, 25, 27, 28, 30],
+            [29, 31, 32, 34, 35]]),
+    array([[ 0,  0, -1,  0,  0],
+            [ 0,  0, -1,  0,  0],
+            [ 0,  0, -1,  0,  0],
+            [ 0,  0, -1,  0,  0],
+            [ 0,  0, -1,  0,  0]]))
+    >>> from scipy import misc
+    >>> import matplotlib.pyplot as plt
+    >>> fig = plt.figure()
+    >>> plt.gray()  # show the filtered result in grayscale
+    >>> ax1 = fig.add_subplot(121)  # left side
+    >>> ax2 = fig.add_subplot(122)  # right side
+    >>> ascent = misc.ascent()
+    >>> result = gabor_filter(ascent, sigma=5, phi=[0.0], frequency=0.1)
+    >>> ax1.imshow(ascent)
+    >>> ax2.imshow(result[0])
+    >>> plt.show()
+    """
+    input = numpy.asarray(input)
+    sigmas = _ni_support._normalize_sequence(sigma, input.ndim)
+    phi = _ni_support._normalize_sequence(phi, input.ndim - 1)
+    frequency = _ni_support._check_float(frequency)
+    offset = _ni_support._check_float(offset)
+
+    limits = [numpy.ceil(truncate * sigma).astype(int) for sigma in sigmas]
+    ranges = [range(-limit, limit + 1) for limit in limits]
+    coords = numpy.meshgrid(*ranges, indexing='ij')
+    filter_size = coords[0].shape
+    coords = numpy.stack(coords, axis=-1)
+
+    new_shape = numpy.ones(input.ndim)
+    new_shape = numpy.append(new_shape, -1).astype(int)
+    sigmas = numpy.reshape(sigmas, new_shape)
+
+    g = numpy.zeros(filter_size, dtype=numpy.complex)
+    g[:] = numpy.exp(-0.5 * numpy.sum(numpy.divide(coords, sigmas)**2, axis=-1))
+
+    g /= (2 * numpy.pi)**(input.ndim / 2) * numpy.prod(sigmas)
+
+    orientation = numpy.ones(input.ndim)
+    for i, p in enumerate(phi):
+        orientation[i + 1] = orientation[i] * numpy.sin(p)
+        orientation[i] = orientation[i] * numpy.cos(p)
+    orientation = numpy.flip(orientation, axis=0)
+
+    rotx = coords @ orientation
+
+    g *= numpy.exp(1j * (2 * numpy.pi * frequency * rotx + offset))
+
+    if isinstance(output, (type, numpy.dtype)):
+        otype = output
+    elif isinstance(output, str):
+        otype = numpy.typeDict[output]
+    else:
+        otype = None
+
+    output = convolve(input, weights=numpy.real(g),
+                      output=output, mode=mode, cval=cval)
+    imag = convolve(input, weights=numpy.imag(g),
+                    output=otype, mode=mode, cval=cval)
+
+    result = (output, imag)
+    return result
+
+
+@_ni_docstrings.docfiller
 def prewitt(input, axis=-1, output=None, mode="reflect", cval=0.0):
     """Calculate a Prewitt filter.
 
@@ -329,7 +464,7 @@ def prewitt(input, axis=-1, output=None, mode="reflect", cval=0.0):
     >>> plt.show()
     """
     input = numpy.asarray(input)
-    axis = _ni_support._check_axis(axis, input.ndim)
+    axis = normalize_axis_index(axis, input.ndim)
     output = _ni_support._get_output(output, input)
     modes = _ni_support._normalize_sequence(mode, input.ndim)
     correlate1d(input, [-1, 0, 1], axis, output, modes[axis], cval, 0)
@@ -366,7 +501,7 @@ def sobel(input, axis=-1, output=None, mode="reflect", cval=0.0):
     >>> plt.show()
     """
     input = numpy.asarray(input)
-    axis = _ni_support._check_axis(axis, input.ndim)
+    axis = normalize_axis_index(axis, input.ndim)
     output = _ni_support._get_output(output, input)
     modes = _ni_support._normalize_sequence(mode, input.ndim)
     correlate1d(input, [-1, 0, 1], axis, output, modes[axis], cval, 0)
@@ -617,10 +752,18 @@ def _correlate_or_convolve(input, weights, output, mode, cval, origin,
     if not weights.flags.contiguous:
         weights = weights.copy()
     output = _ni_support._get_output(output, input)
+    temp_needed = numpy.may_share_memory(input, output)
+    if temp_needed:
+        # input and output arrays cannot share memory
+        temp = output
+        output = _ni_support._get_output(output.dtype, input)
     if not isinstance(mode, str) and isinstance(mode, Iterable):
         raise RuntimeError("A sequence of modes is not supported")
     mode = _ni_support._extend_mode_to_code(mode)
     _nd_image.correlate(input, weights, output, mode, cval, origins)
+    if temp_needed:
+        temp[...] = output
+        output = temp
     return output
 
 
@@ -642,9 +785,46 @@ def correlate(input, weights, output=None, mode='reflect', cval=0.0,
     %(cval)s
     %(origin_multiple)s
 
+    Returns
+    -------
+    result : ndarray
+        The result of correlation of `input` with `weights`.
+
     See Also
     --------
     convolve : Convolve an image with a kernel.
+
+    Examples
+    --------
+    Correlation is the process of moving a filter mask often referred to
+    as kernel over the image and computing the sum of products at each location.
+
+    >>> from scipy.ndimage import correlate
+    >>> input_img = np.arange(25).reshape(5,5)
+    >>> print(input_img)
+    [[ 0  1  2  3  4]
+    [ 5  6  7  8  9]
+    [10 11 12 13 14]
+    [15 16 17 18 19]
+    [20 21 22 23 24]]
+
+    Define a kernel (weights) for correlation. In this example, it is for sum of
+    center and up, down, left and right next elements.
+
+    >>> weights = [[0, 1, 0],
+    ...            [1, 1, 1],
+    ...            [0, 1, 0]]
+
+    We can calculate a correlation result:
+    For example, element ``[2,2]`` is ``7 + 11 + 12 + 13 + 17 = 60``.
+
+    >>> correlate(input_img, weights)
+    array([[  6,  10,  15,  20,  24],
+        [ 26,  30,  35,  40,  44],
+        [ 51,  55,  60,  65,  69],
+        [ 76,  80,  85,  90,  94],
+        [ 96, 100, 105, 110, 114]])
+
     """
     return _correlate_or_convolve(input, weights, output, mode, cval,
                                   origin, False)
@@ -784,7 +964,7 @@ def uniform_filter1d(input, size, axis=-1, output=None,
     input = numpy.asarray(input)
     if numpy.iscomplexobj(input):
         raise TypeError('Complex type not supported')
-    axis = _ni_support._check_axis(axis, input.ndim)
+    axis = normalize_axis_index(axis, input.ndim)
     if size < 1:
         raise RuntimeError('incorrect filter size')
     output = _ni_support._get_output(output, input)
@@ -898,7 +1078,7 @@ def minimum_filter1d(input, size, axis=-1, output=None,
     input = numpy.asarray(input)
     if numpy.iscomplexobj(input):
         raise TypeError('Complex type not supported')
-    axis = _ni_support._check_axis(axis, input.ndim)
+    axis = normalize_axis_index(axis, input.ndim)
     if size < 1:
         raise RuntimeError('incorrect filter size')
     output = _ni_support._get_output(output, input)
@@ -955,7 +1135,7 @@ def maximum_filter1d(input, size, axis=-1, output=None,
     input = numpy.asarray(input)
     if numpy.iscomplexobj(input):
         raise TypeError('Complex type not supported')
-    axis = _ni_support._check_axis(axis, input.ndim)
+    axis = normalize_axis_index(axis, input.ndim)
     if size < 1:
         raise RuntimeError('incorrect filter size')
     output = _ni_support._get_output(output, input)
@@ -997,6 +1177,11 @@ def _min_or_max_filter(input, size, footprint, structure, output, mode,
     if numpy.iscomplexobj(input):
         raise TypeError('Complex type not supported')
     output = _ni_support._get_output(output, input)
+    temp_needed = numpy.may_share_memory(input, output)
+    if temp_needed:
+        # input and output arrays cannot share memory
+        temp = output
+        output = _ni_support._get_output(output.dtype, input)
     origins = _ni_support._normalize_sequence(origin, input.ndim)
     if separable:
         sizes = _ni_support._normalize_sequence(size, input.ndim)
@@ -1035,6 +1220,9 @@ def _min_or_max_filter(input, size, footprint, structure, output, mode,
         mode = _ni_support._extend_mode_to_code(mode)
         _nd_image.min_or_max_filter(input, footprint, structure, output,
                                     mode, cval, origins, minimum)
+    if temp_needed:
+        temp[...] = output
+        output = temp
     return output
 
 
@@ -1171,6 +1359,11 @@ def _rank_filter(input, rank, size=None, footprint=None, output=None,
                               origins)
     else:
         output = _ni_support._get_output(output, input)
+        temp_needed = numpy.may_share_memory(input, output)
+        if temp_needed:
+            # input and output arrays cannot share memory
+            temp = output
+            output = _ni_support._get_output(output.dtype, input)
         if not isinstance(mode, str) and isinstance(mode, Iterable):
             raise RuntimeError(
                 "A sequence of modes is not supported by non-separable rank "
@@ -1178,6 +1371,9 @@ def _rank_filter(input, rank, size=None, footprint=None, output=None,
         mode = _ni_support._extend_mode_to_code(mode)
         _nd_image.rank_filter(input, rank, footprint, output, mode, cval,
                               origins)
+        if temp_needed:
+            temp[...] = output
+            output = temp
         return output
 
 
@@ -1372,7 +1568,7 @@ def generic_filter1d(input, function, filter_size, axis=-1,
     output = _ni_support._get_output(output, input)
     if filter_size < 1:
         raise RuntimeError('invalid filter size')
-    axis = _ni_support._check_axis(axis, input.ndim)
+    axis = normalize_axis_index(axis, input.ndim)
     if (filter_size // 2 + origin < 0) or (filter_size // 2 + origin >=
                                            filter_size):
         raise ValueError('invalid origin')
